@@ -63,6 +63,31 @@ using ::cuda::experimental::places::exec_place_scope;
 using ::cuda::experimental::places::mv;
 using ::cuda::experimental::places::place_group;
 
+namespace detail
+{
+/**
+ * @brief Throw when @p stream is part of an active CUDA stream capture (or,
+ * for `nullptr`, when a global-mode capture is active anywhere in the
+ * process): the caller performs synchronization, allocation or host
+ * transfers, none of which can be recorded into a CUDA graph.
+ *
+ * The check itself is a safe query: refusing an operation this way leaves the
+ * ongoing capture VALID, so the caller can catch the exception and keep
+ * capturing supported work.
+ */
+inline void check_not_capturing(cudaStream_t stream, const char* what)
+{
+  if (places::stream_in_capture(stream))
+  {
+    _CCCL_THROW(::std::runtime_error,
+                ::std::string(what)
+                  + ": not supported during CUDA graph capture. Only the non-blocking elementwise "
+                    "algorithms can be captured; allocation, host transfers and synchronous algorithms "
+                    "must run outside capture");
+  }
+}
+} // namespace detail
+
 /// @brief How a container's memory is owned and released.
 enum class ownership
 {
@@ -168,6 +193,15 @@ public:
    */
   static sharded_array allocate(const ::std::vector<shard_spec>& specs)
   {
+    detail::check_not_capturing(nullptr, "sharded_array::allocate");
+    for (const auto& spec : specs)
+    {
+      if (cudaStream_t stream = ::std::get<3>(spec))
+      {
+        detail::check_not_capturing(stream, "sharded_array::allocate");
+      }
+    }
+
     sharded_array arr;
     arr.ownership_ = ownership::owning_shards;
 
@@ -292,6 +326,15 @@ public:
    */
   static sharded_array allocate_contiguous(const ::std::vector<shard_spec>& specs)
   {
+    detail::check_not_capturing(nullptr, "sharded_array::allocate_contiguous");
+    for (const auto& spec : specs)
+    {
+      if (cudaStream_t stream = ::std::get<3>(spec))
+      {
+        detail::check_not_capturing(stream, "sharded_array::allocate_contiguous");
+      }
+    }
+
     sharded_array arr;
     arr.ownership_ = ownership::owning_backing; // released via contiguous_backing_
 
@@ -461,6 +504,7 @@ public:
    */
   void copy_from_host(const _Tp* host_data)
   {
+    check_not_capturing_any("sharded_array::copy_from_host");
     for (auto& s : shards_)
     {
       exec_place_scope scope(s.exec);
@@ -483,6 +527,7 @@ public:
    */
   void copy_to_host(_Tp* host_data) const
   {
+    check_not_capturing_any("sharded_array::copy_to_host");
     each_shard->*[host_data](const auto& s) {
       cuda_safe_call(cudaMemcpy(host_data + s.global_offset, s.data, s.size_bytes(), cudaMemcpyDefault));
     };
@@ -547,8 +592,13 @@ public:
   each_shard_visitor each_shard;
 
   /// @brief Synchronize every shard's reference stream.
+  /// @throws std::runtime_error under an active CUDA stream capture
+  /// (synchronization cannot be recorded into a graph; the capture stays
+  /// valid, so pass `blocking = false` to the elementwise algorithms and
+  /// synchronize outside capture instead).
   void sync() const
   {
+    check_not_capturing_any("sharded_array::sync");
     for (const auto& s : shards_)
     {
       if (s.stream)
@@ -984,6 +1034,21 @@ public:
   }
 
 private:
+  /// Refuse synchronous/host-side member operations under an active capture:
+  /// probes a global-mode capture anywhere in the process (legacy stream) and
+  /// each shard's reference stream. Throws without touching the capture.
+  void check_not_capturing_any(const char* what) const
+  {
+    detail::check_not_capturing(nullptr, what);
+    for (const auto& s : shards_)
+    {
+      if (s.stream)
+      {
+        detail::check_not_capturing(s.stream, what);
+      }
+    }
+  }
+
   static ::std::vector<size_t> split_evenly(size_t total_size, size_t parts)
   {
     ::std::vector<size_t> sizes(parts, 0);
@@ -1038,6 +1103,28 @@ private:
   // the ordering declarations are const — they do not modify elements).
   mutable detail::fork_join_event_pool fork_join_events_;
 };
+
+namespace detail
+{
+/**
+ * @brief Refuse a synchronous sharded algorithm under an active CUDA stream
+ * capture: probes a global-mode capture anywhere in the process (legacy
+ * stream) and every shard's reference stream. Safe query; throwing leaves the
+ * capture valid.
+ */
+template <typename _Tp>
+void check_not_capturing(const sharded_array<_Tp>& data, const char* what)
+{
+  check_not_capturing(nullptr, what);
+  for (const auto& s : data)
+  {
+    if (s.stream)
+    {
+      check_not_capturing(s.stream, what);
+    }
+  }
+}
+} // namespace detail
 
 // ============================================================================
 // Compatibility checks
@@ -1105,6 +1192,9 @@ void copy_between(const sharded_array<_Tp>& src, sharded_array<_Tp>& dst)
   {
     return;
   }
+
+  detail::check_not_capturing(src, "sharded::copy_between");
+  detail::check_not_capturing(dst, "sharded::copy_between");
 
   for (auto& dst_shard : dst)
   {
